@@ -106,7 +106,7 @@ jobs:
                   print(f"No rows available (total={total})")
           PY
 
-      - name: Run single signup
+      - name: Run single test
         if: steps.claim.outputs.has_row == 'true'
         env:
           CI: "true"
