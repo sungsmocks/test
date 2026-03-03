@@ -207,8 +207,17 @@ def human_mouse_move(sb, selector):
 
 
 def human_click(sb, selector):
+    """Best-effort click with robust waiting.
+
+    Prefer JS-based deep waits for CSS selectors because SeleniumBase CDP
+    wait_for_element() can be brittle with component-heavy pages.
+    """
+
     try:
-        sb.cdp.wait_for_element(selector, timeout=10)
+        if selector.startswith('/'):
+            sb.cdp.wait_for_element(selector, timeout=10)
+        else:
+            deep_wait_for_selector(sb, selector, timeout=10, require_visible=True)
         human_pause(sb, 0.05, 0.2)
         human_mouse_move(sb, selector)
         sb.cdp.sleep(random.uniform(0.1, 0.25))
@@ -229,10 +238,10 @@ def human_click(sb, selector):
 
 
 def deep_wait_for_selector(sb, selector, timeout=12, require_visible=True):
-    """Wait for a CSS selector to appear in light DOM or *open* Shadow DOM.
+    """Wait for a CSS selector to appear in light DOM, *open* Shadow DOM, or same-origin iframes.
 
-    SeleniumBase CDP's wait_for_element() doesn't pierce shadow roots.
-    This helper polls via JS and works for most modern component libraries.
+    SeleniumBase CDP's wait_for_element() doesn't pierce shadow roots, and on some
+    pages it can trigger heavy DOM snapshots. This helper polls via lightweight JS.
     """
 
     selector = (selector or "").strip()
@@ -262,8 +271,17 @@ def deep_wait_for_selector(sb, selector, timeout=12, require_visible=True):
 
         const out = [];
         const seen = new Set();
+        const seenDocs = new Set();
         const walk = (root) => {{
             if (!root) return;
+            try {{
+                // Prevent iframe document loops
+                if (root.nodeType === 9) {{
+                    if (seenDocs.has(root)) return;
+                    seenDocs.add(root);
+                }}
+            }} catch(e) {{}}
+
             try {{
                 const found = root.querySelectorAll ? root.querySelectorAll(sel) : [];
                 for (const el of found) {{
@@ -279,6 +297,10 @@ def deep_wait_for_selector(sb, selector, timeout=12, require_visible=True):
             for (const el of all) {{
                 try {{
                     if (el && el.shadowRoot) walk(el.shadowRoot);
+                }} catch (e) {{}}
+                // Same-origin iframe traversal
+                try {{
+                    if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument);
                 }} catch (e) {{}}
             }}
         }};
@@ -338,8 +360,10 @@ def deep_click(sb, selector, timeout=10):
 
         const found = [];
         const seen = new Set();
+        const seenDocs = new Set();
         const walk = (root) => {{
             if (!root) return;
+            try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return; seenDocs.add(root); }} }} catch(e) {{}}
             try {{
                 const hits = root.querySelectorAll ? root.querySelectorAll(sel) : [];
                 for (const el of hits) {{
@@ -354,6 +378,7 @@ def deep_click(sb, selector, timeout=10):
             try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch (e) {{ all = []; }}
             for (const el of all) {{
                 try {{ if (el && el.shadowRoot) walk(el.shadowRoot); }} catch (e) {{}}
+                try {{ if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); }} catch(e) {{}}
             }}
         }};
         walk(document);
@@ -387,7 +412,7 @@ def deep_click_by_text(sb, text, timeout=10, contains=True):
     if not text:
         return False
 
-    js = f"""
+    js = rf"""
     (function() {{
         const needleRaw = {json.dumps(text)};
         const needle = (needleRaw || '').replace(/\s+/g,' ').trim().toLowerCase();
@@ -411,9 +436,11 @@ def deep_click_by_text(sb, text, timeout=10, contains=True):
         }};
 
         const seen = new Set();
+        const seenDocs = new Set();
         const all = [];
         const walk = (root) => {{
             if (!root) return;
+            try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return; seenDocs.add(root); }} }} catch(e) {{}}
             for (const n of clickablesIn(root)) {{
                 if (!seen.has(n)) {{ seen.add(n); all.push(n); }}
             }}
@@ -421,6 +448,7 @@ def deep_click_by_text(sb, text, timeout=10, contains=True):
             try {{ elems = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch(e) {{ elems = []; }}
             for (const el of elems) {{
                 try {{ if (el && el.shadowRoot) walk(el.shadowRoot); }} catch(e) {{}}
+                try {{ if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); }} catch(e) {{}}
             }}
         }};
         walk(document);
@@ -472,7 +500,10 @@ def deep_click_by_text(sb, text, timeout=10, contains=True):
 
 def select_option_by_text_strict(sb, selector, text, timeout=10):
     try:
-        sb.cdp.wait_for_element(selector, timeout=timeout)
+        if selector.startswith('/'):
+            sb.cdp.wait_for_element(selector, timeout=timeout)
+        else:
+            deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=True)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.05, 0.2)
         sb.cdp.select_option_by_text(selector, (text or "").strip())
@@ -489,8 +520,10 @@ def select_option_by_text_strict(sb, selector, text, timeout=10):
 
         const deepFind = (sel) => {{
             const seen = new Set();
+            const seenDocs = new Set();
             const walk = (root) => {{
                 if (!root) return null;
+                try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return null; seenDocs.add(root); }} }} catch(e) {{}}
                 let hit = null;
                 try {{ hit = root.querySelector ? root.querySelector(sel) : null; }} catch(e) {{ hit = null; }}
                 if (hit) return hit;
@@ -502,6 +535,12 @@ def select_option_by_text_strict(sb, selector, text, timeout=10):
                     try {{
                         if (node.shadowRoot) {{
                             const inner = walk(node.shadowRoot);
+                            if (inner) return inner;
+                        }}
+                    }} catch(e) {{}}
+                    try {{
+                        if (node.tagName === 'IFRAME' && node.contentDocument) {{
+                            const inner = walk(node.contentDocument);
                             if (inner) return inner;
                         }}
                     }} catch(e) {{}}
@@ -550,7 +589,10 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
         return out
 
     try:
-        sb.cdp.wait_for_element(selector, timeout=timeout)
+        if selector.startswith('/'):
+            sb.cdp.wait_for_element(selector, timeout=timeout)
+        else:
+            deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=True)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.05, 0.2)
         for candidate in _alt_text_candidates(text):
@@ -571,8 +613,10 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
 
         const deepFind = (sel) => {{
             const seen = new Set();
+            const seenDocs = new Set();
             const walk = (root) => {{
                 if (!root) return null;
+                try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return null; seenDocs.add(root); }} }} catch(e) {{}}
                 let hit = null;
                 try {{ hit = root.querySelector ? root.querySelector(sel) : null; }} catch(e) {{ hit = null; }}
                 if (hit) return hit;
@@ -584,6 +628,12 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
                     try {{
                         if (node.shadowRoot) {{
                             const inner = walk(node.shadowRoot);
+                            if (inner) return inner;
+                        }}
+                    }} catch(e) {{}}
+                    try {{
+                        if (node.tagName === 'IFRAME' && node.contentDocument) {{
+                            const inner = walk(node.contentDocument);
                             if (inner) return inner;
                         }}
                     }} catch(e) {{}}
@@ -1082,10 +1132,13 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
 
 def human_type(sb, selector, text):
     try:
-        sb.cdp.wait_for_element(selector, timeout=10)
+        if selector.startswith('/'):
+            sb.cdp.wait_for_element(selector, timeout=10)
+        else:
+            deep_wait_for_selector(sb, selector, timeout=10, require_visible=True)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.1, 0.3)
-        
+
         # Gigya and Akamai monitor JS 'value' setters and dispatchEvent speeds to flag bots (zero keyup/keydown latency).
         # We must use the browser's native protocol to natively simulate physical hardware keystrokes.
         sb.cdp.click(selector)
@@ -1160,10 +1213,14 @@ def run_registration(
 
             print("Waiting for page to load...")
             try:
-                sb.cdp.wait_for_element(email_selector, timeout=20)
+                # Avoid CDP wait_for_element() recursion issues; use JS polling instead.
+                deep_wait_for_selector(sb, email_selector, timeout=30, require_visible=True)
                 human_pause(sb, 0.8, 1.6)
             except Exception:
-                sb.cdp.sleep(10)
+                try:
+                    sb.cdp.sleep(10)
+                except Exception:
+                    time.sleep(10)
             print("Page load wait complete.")
 
             try:
@@ -1236,9 +1293,13 @@ def run_registration(
             loaded = False
             for cand in otp_wait_candidates:
                 try:
-                    sb.cdp.wait_for_element(cand, timeout=6)
-                    loaded = True
-                    break
+                    if cand.startswith('/'):
+                        sb.cdp.wait_for_element(cand, timeout=6)
+                        loaded = True
+                        break
+                    if deep_wait_for_selector(sb, cand, timeout=3, require_visible=True):
+                        loaded = True
+                        break
                 except Exception:
                     continue
 
@@ -1329,12 +1390,54 @@ def run_registration(
                 # Birth-year select may be rendered inside a web component; match by name OR id.
                 birth_year_selector = 'select[name*="additionalCustomerAttributes"], select[id*="additionalCustomerAttributes"]'
 
+                def wait_for_profile_ready(timeout_s=80):
+                    """Wait until we're actually on the profile page route and the selects exist.
+
+                    The flow often goes through OAuth/SSO redirects before landing on:
+                      https://tickets.la28.org/mycustomerdata/?#/myCustomerData
+                    """
+
+                    end = time.time() + timeout_s
+                    last_url = None
+                    while time.time() < end:
+                        try:
+                            last_url = sb.cdp.get_current_url()
+                        except Exception:
+                            last_url = None
+
+                        lurl = (last_url or "").lower()
+
+                        # If we're stuck on the generic OAuth hash-route, keep waiting.
+                        if lurl and ("/mycustomerdata/" in lurl) and ("#/generic" in lurl):
+                            try:
+                                sb.cdp.sleep(0.8)
+                            except Exception:
+                                time.sleep(0.8)
+                            continue
+
+                        # Best signal: birth-year select exists (deep). Don't require visible
+                        # because the SPA may render it first and animate it in.
+                        if deep_wait_for_selector(sb, birth_year_selector, timeout=1.2, require_visible=False):
+                            return True
+
+                        # Log redirect state when debugging.
+                        if is_truthy(os.getenv("DEBUG_DOM")) and last_url and ("iss=" in last_url or "code=" in last_url or "#/generic" in last_url):
+                            print(f"DEBUG_DOM redirecting... url={last_url}")
+
+                        try:
+                            sb.cdp.sleep(0.8)
+                        except Exception:
+                            time.sleep(0.8)
+
+                    if is_truthy(os.getenv("DEBUG_DOM")):
+                        print(f"DEBUG_DOM profile page not ready after timeout. last_url={last_url}")
+                    return False
+
                 print("Waiting for profile page to load...")
-                if deep_wait_for_selector(sb, birth_year_selector, timeout=25, require_visible=True):
-                    human_pause(sb, 0.8, 1.6)
-                elif deep_wait_for_selector(sb, 'select[name*="additionalCustomerAttributes"]', timeout=30, require_visible=True):
+                if wait_for_profile_ready(timeout_s=80):
                     human_pause(sb, 0.8, 1.6)
                 else:
+                    # Hard fallback: give the SPA a bit more time.
                     try:
                         sb.cdp.sleep(10)
                     except Exception:
@@ -1343,6 +1446,20 @@ def run_registration(
 
                 print("Profile page loaded.")
                 human_pause(sb, 0.8, 1.6)
+
+                # Ensure favorites selects exist before attempting to set them.
+                deep_wait_for_selector(
+                    sb,
+                    'select[name*="categoryFavorites"], select[id*="categoryFavorites"]',
+                    timeout=25,
+                    require_visible=False,
+                )
+                deep_wait_for_selector(
+                    sb,
+                    'select[name*="artistFavorites"], select[id*="artistFavorites"]',
+                    timeout=25,
+                    require_visible=False,
+                )
 
                 birth_years = [
                     "1960",
@@ -1537,16 +1654,21 @@ def run_registration(
                     js = """
                     (function(){
                       const seen = new Set();
+                      const seenDocs = new Set();
                       const selects = [];
                       const walk = (root) => {
                         if (!root) return;
+                        try { if (root.nodeType === 9) { if (seenDocs.has(root)) return; seenDocs.add(root); } } catch(e) {}
                         try {
                           const hits = root.querySelectorAll ? Array.from(root.querySelectorAll('select')) : [];
                           for (const s of hits) { if (!seen.has(s)) { seen.add(s); selects.push(s); } }
                         } catch(e) {}
                         let all = [];
                         try { all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; } catch(e) { all = []; }
-                        for (const el of all) { try { if (el && el.shadowRoot) walk(el.shadowRoot); } catch(e) {} }
+                        for (const el of all) {
+                          try { if (el && el.shadowRoot) walk(el.shadowRoot); } catch(e) {}
+                          try { if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); } catch(e) {}
+                        }
                       };
                       walk(document);
 
@@ -1582,7 +1704,7 @@ def run_registration(
                         return {}
 
                 def _page_has_success_text():
-                    js = """
+                    js = r"""
                     (function(){
                       const text = ((document.body && (document.body.innerText || document.body.textContent)) || '').replace(/\s+/g,' ').toLowerCase();
                       return (
