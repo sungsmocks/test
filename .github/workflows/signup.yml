@@ -1,4 +1,4 @@
-name: LA28 Signup
+name: TESTING
 
 on:
   repository_dispatch:
