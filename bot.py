@@ -207,17 +207,8 @@ def human_mouse_move(sb, selector):
 
 
 def human_click(sb, selector):
-    """Best-effort click with robust waiting.
-
-    Prefer JS-based deep waits for CSS selectors because SeleniumBase CDP
-    wait_for_element() can be brittle with component-heavy pages.
-    """
-
     try:
-        if selector.startswith('/'):
-            sb.cdp.wait_for_element(selector, timeout=10)
-        else:
-            deep_wait_for_selector(sb, selector, timeout=10, require_visible=True)
+        sb.cdp.wait_for_element(selector, timeout=10)
         human_pause(sb, 0.05, 0.2)
         human_mouse_move(sb, selector)
         sb.cdp.sleep(random.uniform(0.1, 0.25))
@@ -229,281 +220,13 @@ def human_click(sb, selector):
             sb.cdp.click(selector)
             return True
         except Exception:
-            # Last resort: try a deep DOM click (pierces open Shadow DOM).
-            if not selector.startswith('/'):
-                if deep_click(sb, selector, timeout=6):
-                    return True
             print(f"Click failed on selector: {selector}")
             return False
 
 
-def deep_wait_for_selector(sb, selector, timeout=12, require_visible=True):
-    """Wait for a CSS selector to appear in light DOM, *open* Shadow DOM, or same-origin iframes.
-
-    SeleniumBase CDP's wait_for_element() doesn't pierce shadow roots, and on some
-    pages it can trigger heavy DOM snapshots. This helper polls via lightweight JS.
-    """
-
-    selector = (selector or "").strip()
-    if not selector:
-        return False
-
-    if selector.startswith('/'):
-        # XPath cannot pierce closed shadow roots; fall back to SeleniumBase.
-        try:
-            sb.cdp.wait_for_element(selector, timeout=timeout)
-            return True
-        except Exception:
-            return False
-
-    js = f"""
-    (function() {{
-        const sel = {json.dumps(selector)};
-        const requireVisible = {json.dumps(bool(require_visible))};
-
-        const isVisible = (node) => {{
-            if (!node) return false;
-            const style = window.getComputedStyle(node);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-            const r = node.getBoundingClientRect();
-            return (r.width > 0 && r.height > 0);
-        }};
-
-        const out = [];
-        const seen = new Set();
-        const seenDocs = new Set();
-        const walk = (root) => {{
-            if (!root) return;
-            try {{
-                // Prevent iframe document loops
-                if (root.nodeType === 9) {{
-                    if (seenDocs.has(root)) return;
-                    seenDocs.add(root);
-                }}
-            }} catch(e) {{}}
-
-            try {{
-                const found = root.querySelectorAll ? root.querySelectorAll(sel) : [];
-                for (const el of found) {{
-                    if (!seen.has(el)) {{
-                        seen.add(el);
-                        out.push(el);
-                    }}
-                }}
-            }} catch (e) {{}}
-
-            let all = [];
-            try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch (e) {{ all = []; }}
-            for (const el of all) {{
-                try {{
-                    if (el && el.shadowRoot) walk(el.shadowRoot);
-                }} catch (e) {{}}
-                // Same-origin iframe traversal
-                try {{
-                    if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument);
-                }} catch (e) {{}}
-            }}
-        }};
-
-        walk(document);
-        if (!out.length) return {{ ok: false, count: 0, visible: 0 }};
-        const visible = out.filter(isVisible).length;
-        if (requireVisible && visible === 0) return {{ ok: false, count: out.length, visible }};
-        return {{ ok: true, count: out.length, visible }};
-    }})();
-    """
-
-    end = time.time() + timeout
-    last = None
-    while time.time() < end:
-        try:
-            last = sb.cdp.evaluate(js)
-            if isinstance(last, dict) and last.get("ok"):
-                return True
-        except Exception:
-            last = None
-        try:
-            sb.cdp.sleep(0.35)
-        except Exception:
-            time.sleep(0.35)
-
-    if is_truthy(os.getenv("DEBUG_DOM")):
-        print(f"DEBUG_DOM deep_wait_for_selector timed out for '{selector}'. last={last}")
-    return False
-
-
-def deep_click(sb, selector, timeout=10):
-    """Click a CSS selector through open Shadow DOM if needed."""
-
-    selector = (selector or "").strip()
-    if not selector:
-        return False
-
-    if selector.startswith('/'):
-        # XPath click (no shadow piercing).
-        return human_click(sb, selector)
-
-    if not deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=True):
-        return False
-
-    js = f"""
-    (function() {{
-        const sel = {json.dumps(selector)};
-
-        const isVisible = (node) => {{
-            if (!node) return false;
-            const style = window.getComputedStyle(node);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-            const r = node.getBoundingClientRect();
-            return (r.width > 0 && r.height > 0);
-        }};
-
-        const found = [];
-        const seen = new Set();
-        const seenDocs = new Set();
-        const walk = (root) => {{
-            if (!root) return;
-            try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return; seenDocs.add(root); }} }} catch(e) {{}}
-            try {{
-                const hits = root.querySelectorAll ? root.querySelectorAll(sel) : [];
-                for (const el of hits) {{
-                    if (!seen.has(el)) {{
-                        seen.add(el);
-                        found.push(el);
-                    }}
-                }}
-            }} catch (e) {{}}
-
-            let all = [];
-            try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch (e) {{ all = []; }}
-            for (const el of all) {{
-                try {{ if (el && el.shadowRoot) walk(el.shadowRoot); }} catch (e) {{}}
-                try {{ if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); }} catch(e) {{}}
-            }}
-        }};
-        walk(document);
-
-        const target = found.find(isVisible) || found[0];
-        if (!target) return {{ ok: false, reason: 'not found' }};
-        try {{ target.scrollIntoView({{block:'center', inline:'center'}}); }} catch(e) {{}}
-        try {{ target.focus && target.focus(); }} catch(e) {{}}
-        try {{ target.click(); return {{ ok: true }}; }} catch(e) {{ return {{ ok: false, reason: String(e) }}; }}
-    }})();
-    """
-
-    try:
-        r = sb.cdp.evaluate(js)
-        if isinstance(r, dict) and r.get("ok"):
-            sb.cdp.sleep(random.uniform(0.15, 0.35))
-            return True
-    except Exception:
-        return False
-
-    return False
-
-
-def deep_click_by_text(sb, text, timeout=10, contains=True):
-    """Click a button-ish element by text through open Shadow DOM.
-
-    Useful when the clickable is inside a web component (e.g., ev-pl-button).
-    """
-
-    text = (text or "").strip()
-    if not text:
-        return False
-
-    js = rf"""
-    (function() {{
-        const needleRaw = {json.dumps(text)};
-        const needle = (needleRaw || '').replace(/\s+/g,' ').trim().toLowerCase();
-        const contains = {json.dumps(bool(contains))};
-
-        const isVisible = (node) => {{
-            if (!node) return false;
-            const style = window.getComputedStyle(node);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-            const r = node.getBoundingClientRect();
-            return (r.width > 0 && r.height > 0);
-        }};
-
-        const norm = (t) => (t || '').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim().toLowerCase();
-
-        const clickablesIn = (root) => {{
-            const sel = 'button,[role="button"],a,input[type="button"],input[type="submit"],ev-pl-button';
-            let nodes = [];
-            try {{ nodes = root.querySelectorAll ? Array.from(root.querySelectorAll(sel)) : []; }} catch(e) {{ nodes = []; }}
-            return nodes;
-        }};
-
-        const seen = new Set();
-        const seenDocs = new Set();
-        const all = [];
-        const walk = (root) => {{
-            if (!root) return;
-            try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return; seenDocs.add(root); }} }} catch(e) {{}}
-            for (const n of clickablesIn(root)) {{
-                if (!seen.has(n)) {{ seen.add(n); all.push(n); }}
-            }}
-            let elems = [];
-            try {{ elems = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch(e) {{ elems = []; }}
-            for (const el of elems) {{
-                try {{ if (el && el.shadowRoot) walk(el.shadowRoot); }} catch(e) {{}}
-                try {{ if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); }} catch(e) {{}}
-            }}
-        }};
-        walk(document);
-
-        const score = (n) => {{
-            const t = norm(n.textContent || n.value || n.getAttribute('aria-label') || n.getAttribute('title') || '');
-            if (!t) return 0;
-            if (contains) return t.includes(needle) ? (needle.length / Math.max(t.length, 1)) : 0;
-            return t === needle ? 1 : 0;
-        }};
-
-        const candidates = all
-          .map(n => ({{n, s: score(n)}}))
-          .filter(x => x.s > 0)
-          .sort((a,b) => b.s - a.s)
-          .map(x => x.n)
-          .filter(isVisible);
-
-        const target = candidates[0];
-        if (!target) return {{ok:false, reason:'no candidates'}};
-        try {{ target.scrollIntoView({{block:'center', inline:'center'}}); }} catch(e) {{}}
-        try {{ target.focus && target.focus(); }} catch(e) {{}}
-        try {{ target.click(); return {{ok:true}}; }} catch(e) {{ return {{ok:false, reason:String(e)}}; }}
-    }})();
-    """
-
-    end = time.time() + timeout
-    last = None
-    while time.time() < end:
-        try:
-            last = sb.cdp.evaluate(js)
-            if isinstance(last, dict) and last.get("ok"):
-                try:
-                    sb.cdp.sleep(random.uniform(0.2, 0.5))
-                except Exception:
-                    pass
-                return True
-        except Exception:
-            last = None
-        try:
-            sb.cdp.sleep(0.45)
-        except Exception:
-            time.sleep(0.45)
-
-    if is_truthy(os.getenv("DEBUG_DOM")):
-        print(f"DEBUG_DOM deep_click_by_text timed out for text='{text}'. last={last}")
-    return False
-
-
 def select_option_by_text_strict(sb, selector, text, timeout=10):
     try:
-        if selector.startswith('/'):
-            sb.cdp.wait_for_element(selector, timeout=timeout)
-        else:
-            deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=True)
+        sb.cdp.wait_for_element(selector, timeout=timeout)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.05, 0.2)
         sb.cdp.select_option_by_text(selector, (text or "").strip())
@@ -517,44 +240,12 @@ def select_option_by_text_strict(sb, selector, text, timeout=10):
         let el = null;
         const selector = {json.dumps(selector)};
         const targetText = {json.dumps((text or "").strip())};
-
-        const deepFind = (sel) => {{
-            const seen = new Set();
-            const seenDocs = new Set();
-            const walk = (root) => {{
-                if (!root) return null;
-                try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return null; seenDocs.add(root); }} }} catch(e) {{}}
-                let hit = null;
-                try {{ hit = root.querySelector ? root.querySelector(sel) : null; }} catch(e) {{ hit = null; }}
-                if (hit) return hit;
-                let all = [];
-                try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch(e) {{ all = []; }}
-                for (const node of all) {{
-                    if (!node || seen.has(node)) continue;
-                    seen.add(node);
-                    try {{
-                        if (node.shadowRoot) {{
-                            const inner = walk(node.shadowRoot);
-                            if (inner) return inner;
-                        }}
-                    }} catch(e) {{}}
-                    try {{
-                        if (node.tagName === 'IFRAME' && node.contentDocument) {{
-                            const inner = walk(node.contentDocument);
-                            if (inner) return inner;
-                        }}
-                    }} catch(e) {{}}
-                }}
-                return null;
-            }};
-            return walk(document);
-        }};
-
-        if (selector.startsWith('/')) {{
+        try {{
+            el = document.querySelector(selector);
+        }} catch (e) {{}}
+        if (!el && selector.startsWith('/')) {{
             const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
             el = result.singleNodeValue;
-        }} else {{
-            el = deepFind(selector);
         }}
         if (!el) return {{ok: false, reason: 'select not found'}};
         const options = Array.from(el.options || []);
@@ -589,10 +280,7 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
         return out
 
     try:
-        if selector.startswith('/'):
-            sb.cdp.wait_for_element(selector, timeout=timeout)
-        else:
-            deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=True)
+        sb.cdp.wait_for_element(selector, timeout=timeout)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.05, 0.2)
         for candidate in _alt_text_candidates(text):
@@ -610,44 +298,12 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
         let el = null;
         const selector = {json.dumps(selector)};
         const targetTextRaw = {json.dumps(text)};
-
-        const deepFind = (sel) => {{
-            const seen = new Set();
-            const seenDocs = new Set();
-            const walk = (root) => {{
-                if (!root) return null;
-                try {{ if (root.nodeType === 9) {{ if (seenDocs.has(root)) return null; seenDocs.add(root); }} }} catch(e) {{}}
-                let hit = null;
-                try {{ hit = root.querySelector ? root.querySelector(sel) : null; }} catch(e) {{ hit = null; }}
-                if (hit) return hit;
-                let all = [];
-                try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch(e) {{ all = []; }}
-                for (const node of all) {{
-                    if (!node || seen.has(node)) continue;
-                    seen.add(node);
-                    try {{
-                        if (node.shadowRoot) {{
-                            const inner = walk(node.shadowRoot);
-                            if (inner) return inner;
-                        }}
-                    }} catch(e) {{}}
-                    try {{
-                        if (node.tagName === 'IFRAME' && node.contentDocument) {{
-                            const inner = walk(node.contentDocument);
-                            if (inner) return inner;
-                        }}
-                    }} catch(e) {{}}
-                }}
-                return null;
-            }};
-            return walk(document);
-        }};
-
-        if (selector.startsWith('/')) {{
+        try {{
+            el = document.querySelector(selector);
+        }} catch (e) {{}}
+        if (!el && selector.startsWith('/')) {{
             const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
             el = result.singleNodeValue;
-        }} else {{
-            el = deepFind(selector);
         }}
         if (!el) return {{ok: false, reason: 'select not found'}};
 
@@ -686,47 +342,22 @@ def select_option_by_text_safe(sb, selector, text, timeout=10):
 
 
 def click_add_another_for_select(sb, selector, timeout=8):
-    # Note: selectors for <select> elements may live inside open Shadow DOM.
-    # SeleniumBase CDP wait_for_element() won't see those, so we use deep_wait_for_selector().
-    if not deep_wait_for_selector(sb, selector, timeout=timeout, require_visible=False):
+    try:
+        sb.cdp.wait_for_element(selector, timeout=timeout)
+    except Exception:
         return False
 
     js_code = """
     (function() {
         let el = null;
         const selector = __SELECTOR__;
-
-        const deepFind = (sel) => {
-            const seen = new Set();
-            const walk = (root) => {
-                if (!root) return null;
-                let hit = null;
-                try { hit = root.querySelector ? root.querySelector(sel) : null; } catch(e) { hit = null; }
-                if (hit) return hit;
-                let all = [];
-                try { all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; } catch(e) { all = []; }
-                for (const node of all) {
-                    if (!node || seen.has(node)) continue;
-                    seen.add(node);
-                    try {
-                        if (node.shadowRoot) {
-                            const inner = walk(node.shadowRoot);
-                            if (inner) return inner;
-                        }
-                    } catch(e) {}
-                }
-                return null;
-            };
-            return walk(document);
-        };
-
-        if (selector.startsWith('/')) {
+        try {
+            el = document.querySelector(selector);
+        } catch (e) {}
+        if (!el && selector.startsWith('/')) {
             const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
             el = result.singleNodeValue;
-        } else {
-            el = deepFind(selector);
         }
-
         if (!el) return {ok: false, reason: 'select not found'};
 
         const isVisible = (node) => {
@@ -768,8 +399,7 @@ def click_add_another_for_select(sb, selector, timeout=8):
                 return {ok: true, via: 'text'};
             }
 
-            // Walk up through DOM, crossing Shadow DOM boundaries when needed.
-            container = container.parentElement || (container.getRootNode && container.getRootNode().host) || null;
+            container = container.parentElement;
         }
 
         return {ok: false, reason: 'add button not found'};
@@ -934,33 +564,10 @@ def select_nth_named_select_option(sb, name_contains, index, option_text, timeou
                 const r = node.getBoundingClientRect();
                 return (r.width > 0 && r.height > 0);
             }};
-            const seen = new Set();
-            const allSelects = [];
-            const walk = (root) => {{
-                if (!root) return;
-                try {{
-                    const hits = root.querySelectorAll ? Array.from(root.querySelectorAll('select')) : [];
-                    for (const s of hits) {{
-                        if (!seen.has(s)) {{ seen.add(s); allSelects.push(s); }}
-                    }}
-                }} catch (e) {{}}
-
-                let all = [];
-                try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch (e) {{ all = []; }}
-                for (const el of all) {{
-                    try {{
-                        if (el && el.shadowRoot) walk(el.shadowRoot);
-                    }} catch (e) {{}}
-                }}
-            }};
-            walk(document);
-
-            const selects = allSelects
-                .filter(s => s && (((s.name || '').includes(needle)) || ((s.id || '').includes(needle))))
+            const selects = Array.from(document.querySelectorAll('select'))
+                .filter(s => s && s.name && s.name.includes(needle))
                 .map(s => ({{
-                    name: s.name || null,
-                    id: s.id || null,
-                    key: s.name || s.id || null,
+                    name: s.name,
                     visible: isVisible(s),
                     disabled: !!s.disabled,
                     options: (s.options ? s.options.length : 0)
@@ -977,7 +584,7 @@ def select_nth_named_select_option(sb, name_contains, index, option_text, timeou
             if attempt == 5 and is_truthy(os.getenv("DEBUG_DOM")):
                 try:
                     all_names = sb.cdp.evaluate(
-                        "(function(){const seen=new Set();const out=[];const walk=(root)=>{if(!root) return; try{for(const s of (root.querySelectorAll?Array.from(root.querySelectorAll('select')):[])){if(!seen.has(s)){seen.add(s); out.push(s);}}}catch(e){}; let all=[]; try{all=root.querySelectorAll?Array.from(root.querySelectorAll('*')):[]}catch(e){all=[]}; for(const el of all){try{if(el&&el.shadowRoot) walk(el.shadowRoot);}catch(e){}}}; walk(document); return out.map(s=>s.name||s.id||null).filter(Boolean).slice(0,80)})();"
+                        "(function(){return Array.from(document.querySelectorAll('select')).map(s=>s.name||s.id||null).filter(Boolean).slice(0,50)})();"
                     )
                     print(f"DEBUG_DOM no selects matching '{name_contains}'. First select names/ids: {all_names}")
                 except Exception:
@@ -986,52 +593,30 @@ def select_nth_named_select_option(sb, name_contains, index, option_text, timeou
             continue
 
         if len(selects) < index:
-            last = selects[-1] if selects else {}
-            last_name = last.get("name")
-            last_id = last.get("id")
-            last_sel = None
+            last_name = selects[-1].get("name")
             if last_name:
                 last_sel = f"select[name={json.dumps(last_name)}]"
-            elif last_id:
-                last_sel = f"select[id={json.dumps(last_id)}]"
-
-            if last_sel:
                 click_add_another_for_select(sb, last_sel, timeout=4)
-
             sb.cdp.sleep(0.9)
             continue
 
         target = selects[index - 1]
         target_name = target.get("name")
-        target_id = target.get("id")
         target_visible = target.get("visible")
 
         if not target_visible and index > 1:
-            prev = selects[index - 2]
-            prev_name = prev.get("name")
-            prev_id = prev.get("id")
-            prev_sel = None
+            prev_name = selects[index - 2].get("name")
             if prev_name:
                 prev_sel = f"select[name={json.dumps(prev_name)}]"
-            elif prev_id:
-                prev_sel = f"select[id={json.dumps(prev_id)}]"
-
-            if prev_sel:
                 click_add_another_for_select(sb, prev_sel, timeout=4)
-
             sb.cdp.sleep(0.9)
             continue
 
-        target_selector = None
-        if target_name:
-            target_selector = f"select[name={json.dumps(target_name)}]"
-        elif target_id:
-            target_selector = f"select[id={json.dumps(target_id)}]"
-
-        if not target_selector:
+        if not target_name:
             sb.cdp.sleep(0.5)
             continue
 
+        target_selector = f"select[name={json.dumps(target_name)}]"
         return select_option_by_text_safe(sb, target_selector, option_text, timeout=timeout)
 
     return False
@@ -1051,25 +636,8 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
             const r = node.getBoundingClientRect();
             return (r.width > 0 && r.height > 0);
         }};
-        const seen = new Set();
-        const allSelects = [];
-        const walk = (root) => {{
-            if (!root) return;
-            try {{
-                const hits = root.querySelectorAll ? Array.from(root.querySelectorAll('select')) : [];
-                for (const s of hits) {{
-                    if (!seen.has(s)) {{ seen.add(s); allSelects.push(s); }}
-                }}
-            }} catch (e) {{}}
-            let all = [];
-            try {{ all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; }} catch (e) {{ all = []; }}
-            for (const el of all) {{
-                try {{ if (el && el.shadowRoot) walk(el.shadowRoot); }} catch (e) {{}}
-            }}
-        }};
-        walk(document);
-        const selects = allSelects
-            .filter(s => s && (((s.name || '').includes(needle)) || ((s.id || '').includes(needle))));
+        const selects = Array.from(document.querySelectorAll('select'))
+            .filter(s => s && s.name && s.name.includes(needle));
         const i = {index} - 1;
         if (selects.length <= i) return {{ok:false, reason:'select index missing', count: selects.length}};
         const sel = selects[i];
@@ -1081,9 +649,7 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
             }}));
         return {{
             ok: true,
-            name: sel.name || null,
-            id: sel.id || null,
-            key: sel.name || sel.id || null,
+            name: sel.name,
             visible: isVisible(sel),
             options
         }};
@@ -1095,9 +661,8 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
         return None
 
     sel_name = info.get("name")
-    sel_id = info.get("id")
     options = info.get("options") or []
-    if (not (sel_name or sel_id)) or (not options):
+    if not sel_name or not options:
         return None
 
     cleaned = []
@@ -1120,9 +685,7 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
         return None
 
     random.shuffle(cleaned)
-    target_selector = (
-        f"select[name={json.dumps(sel_name)}]" if sel_name else f"select[id={json.dumps(sel_id)}]"
-    )
+    target_selector = f"select[name={json.dumps(sel_name)}]"
     for candidate in cleaned[:10]:
         if select_option_by_text_safe(sb, target_selector, candidate, timeout=timeout):
             return candidate
@@ -1132,13 +695,10 @@ def select_random_option_in_nth_named_select(sb, name_contains, index, exclude_t
 
 def human_type(sb, selector, text):
     try:
-        if selector.startswith('/'):
-            sb.cdp.wait_for_element(selector, timeout=10)
-        else:
-            deep_wait_for_selector(sb, selector, timeout=10, require_visible=True)
+        sb.cdp.wait_for_element(selector, timeout=10)
         human_mouse_move(sb, selector)
         human_pause(sb, 0.1, 0.3)
-
+        
         # Gigya and Akamai monitor JS 'value' setters and dispatchEvent speeds to flag bots (zero keyup/keydown latency).
         # We must use the browser's native protocol to natively simulate physical hardware keystrokes.
         sb.cdp.click(selector)
@@ -1213,14 +773,10 @@ def run_registration(
 
             print("Waiting for page to load...")
             try:
-                # Avoid CDP wait_for_element() recursion issues; use JS polling instead.
-                deep_wait_for_selector(sb, email_selector, timeout=30, require_visible=True)
+                sb.cdp.wait_for_element(email_selector, timeout=20)
                 human_pause(sb, 0.8, 1.6)
             except Exception:
-                try:
-                    sb.cdp.sleep(10)
-                except Exception:
-                    time.sleep(10)
+                sb.cdp.sleep(10)
             print("Page load wait complete.")
 
             try:
@@ -1293,13 +849,9 @@ def run_registration(
             loaded = False
             for cand in otp_wait_candidates:
                 try:
-                    if cand.startswith('/'):
-                        sb.cdp.wait_for_element(cand, timeout=6)
-                        loaded = True
-                        break
-                    if deep_wait_for_selector(sb, cand, timeout=3, require_visible=True):
-                        loaded = True
-                        break
+                    sb.cdp.wait_for_element(cand, timeout=6)
+                    loaded = True
+                    break
                 except Exception:
                     continue
 
@@ -1387,79 +939,22 @@ def run_registration(
                     except Exception:
                         pass
 
-                # Birth-year select may be rendered inside a web component; match by name OR id.
-                birth_year_selector = 'select[name*="additionalCustomerAttributes"], select[id*="additionalCustomerAttributes"]'
-
-                def wait_for_profile_ready(timeout_s=80):
-                    """Wait until we're actually on the profile page route and the selects exist.
-
-                    The flow often goes through OAuth/SSO redirects before landing on:
-                      https://tickets.la28.org/mycustomerdata/?#/myCustomerData
-                    """
-
-                    end = time.time() + timeout_s
-                    last_url = None
-                    while time.time() < end:
-                        try:
-                            last_url = sb.cdp.get_current_url()
-                        except Exception:
-                            last_url = None
-
-                        lurl = (last_url or "").lower()
-
-                        # If we're stuck on the generic OAuth hash-route, keep waiting.
-                        if lurl and ("/mycustomerdata/" in lurl) and ("#/generic" in lurl):
-                            try:
-                                sb.cdp.sleep(0.8)
-                            except Exception:
-                                time.sleep(0.8)
-                            continue
-
-                        # Best signal: birth-year select exists (deep). Don't require visible
-                        # because the SPA may render it first and animate it in.
-                        if deep_wait_for_selector(sb, birth_year_selector, timeout=1.2, require_visible=False):
-                            return True
-
-                        # Log redirect state when debugging.
-                        if is_truthy(os.getenv("DEBUG_DOM")) and last_url and ("iss=" in last_url or "code=" in last_url or "#/generic" in last_url):
-                            print(f"DEBUG_DOM redirecting... url={last_url}")
-
-                        try:
-                            sb.cdp.sleep(0.8)
-                        except Exception:
-                            time.sleep(0.8)
-
-                    if is_truthy(os.getenv("DEBUG_DOM")):
-                        print(f"DEBUG_DOM profile page not ready after timeout. last_url={last_url}")
-                    return False
+                birth_year_selector = 'select[name^="additionalCustomerAttributes-1_"]'
 
                 print("Waiting for profile page to load...")
-                if wait_for_profile_ready(timeout_s=80):
+                try:
+                    sb.cdp.wait_for_element(birth_year_selector, timeout=18)
                     human_pause(sb, 0.8, 1.6)
-                else:
-                    # Hard fallback: give the SPA a bit more time.
+                except Exception:
                     try:
-                        sb.cdp.sleep(10)
+                        sb.cdp.wait_for_element('select[name*="additionalCustomerAttributes"]', timeout=25)
+                        human_pause(sb, 0.8, 1.6)
                     except Exception:
-                        time.sleep(10)
+                        sb.cdp.sleep(10)
                 print("Profile page load wait complete.")
 
                 print("Profile page loaded.")
                 human_pause(sb, 0.8, 1.6)
-
-                # Ensure favorites selects exist before attempting to set them.
-                deep_wait_for_selector(
-                    sb,
-                    'select[name*="categoryFavorites"], select[id*="categoryFavorites"]',
-                    timeout=25,
-                    require_visible=False,
-                )
-                deep_wait_for_selector(
-                    sb,
-                    'select[name*="artistFavorites"], select[id*="artistFavorites"]',
-                    timeout=25,
-                    require_visible=False,
-                )
 
                 birth_years = [
                     "1960",
@@ -1643,107 +1138,28 @@ def run_registration(
                     )
 
                 if not save_clicked:
-                    # Web components often hide the <button> inside Shadow DOM.
-                    # Click by visible text as a robust, framework-agnostic fallback.
-                    save_clicked = deep_click_by_text(sb, "save", timeout=14, contains=True)
-
-                # Confirm save by waiting for a redirect/success signal.
-                human_pause(sb, 2.5, 4.0)
-
-                def _deep_select_counts():
-                    js = """
-                    (function(){
-                      const seen = new Set();
-                      const seenDocs = new Set();
-                      const selects = [];
-                      const walk = (root) => {
-                        if (!root) return;
-                        try { if (root.nodeType === 9) { if (seenDocs.has(root)) return; seenDocs.add(root); } } catch(e) {}
-                        try {
-                          const hits = root.querySelectorAll ? Array.from(root.querySelectorAll('select')) : [];
-                          for (const s of hits) { if (!seen.has(s)) { seen.add(s); selects.push(s); } }
-                        } catch(e) {}
-                        let all = [];
-                        try { all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : []; } catch(e) { all = []; }
-                        for (const el of all) {
-                          try { if (el && el.shadowRoot) walk(el.shadowRoot); } catch(e) {}
-                          try { if (el && el.tagName === 'IFRAME' && el.contentDocument) walk(el.contentDocument); } catch(e) {}
-                        }
-                      };
-                      walk(document);
-
-                      const norm = (s) => (s || '').toLowerCase();
-                      const byNeedle = (needle) => selects.filter(s => norm(s.name).includes(needle) || norm(s.id).includes(needle));
-                      const filled = (s) => {
-                        try {
-                          const v = (s.value || '').trim();
-                          if (!v) return false;
-                          if (s.selectedIndex !== undefined && s.selectedIndex <= 0) return false;
-                          return true;
-                        } catch(e) { return false; }
-                      };
-
-                      const birth = byNeedle('additionalcustomerattributes');
-                      const sports = byNeedle('categoryfavorites');
-                      const teams = byNeedle('artistfavorites');
-
-                      return {
-                        url: location.href,
-                        birthTotal: birth.length,
-                        birthFilled: birth.filter(filled).length,
-                        sportsTotal: sports.length,
-                        sportsFilled: sports.filter(filled).length,
-                        teamsTotal: teams.length,
-                        teamsFilled: teams.filter(filled).length,
-                      };
-                    })();
-                    """
                     try:
-                        return sb.cdp.evaluate(js) or {}
+                        js = """
+                        (function(){
+                          const norm = (t)=> (t||'').replace(/\\s+/g,' ').trim().toLowerCase();
+                          const nodes = Array.from(document.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]'));
+                          const cand = nodes.find(n=>{const t=norm(n.textContent||n.value||n.getAttribute('aria-label')||''); return t==='save' || t.includes('save');});
+                          if(!cand) return {ok:false};
+                          cand.scrollIntoView({block:'center', inline:'center'});
+                          cand.click();
+                          return {ok:true};
+                        })();
+                        """
+                        r = sb.cdp.evaluate(js)
+                        if isinstance(r, dict) and r.get("ok"):
+                            save_clicked = True
                     except Exception:
-                        return {}
+                        pass
 
-                def _page_has_success_text():
-                    js = r"""
-                    (function(){
-                      const text = ((document.body && (document.body.innerText || document.body.textContent)) || '').replace(/\s+/g,' ').toLowerCase();
-                      return (
-                        text.includes('thank you') ||
-                        text.includes('success') ||
-                        text.includes('saved') ||
-                        text.includes('complete')
-                      );
-                    })();
-                    """
-                    try:
-                        return bool(sb.cdp.evaluate(js))
-                    except Exception:
-                        return False
+                human_pause(sb, 4, 6)
 
-                saved = False
-                final_url = None
-                deadline = time.time() + 25
-                while time.time() < deadline:
-                    try:
-                        final_url = sb.cdp.get_current_url()
-                    except Exception:
-                        final_url = None
-
-                    if final_url and "mydatasuccess" in final_url:
-                        saved = True
-                        break
-
-                    if _page_has_success_text():
-                        # Some flows show a success message without a redirect.
-                        saved = True
-                        break
-
-                    try:
-                        sb.cdp.sleep(0.9)
-                    except Exception:
-                        time.sleep(0.9)
-
-                if saved:
+                final_url = sb.cdp.get_current_url()
+                if "mydatasuccess" in final_url:
                     print("=" * 60)
                     print("SIGNUP SUCCESSFUL!")
                     print("=" * 60)
@@ -1751,12 +1167,9 @@ def run_registration(
                     if DISCORD_WEBHOOK_URL:
                         send_discord_webhook(row_index=row_index)
                     return True
-
-                dbg = _deep_select_counts()
-                print("Profile save not confirmed. Will mark as failure for retry.")
-                print(f"  url={final_url}")
-                print(f"  select_state={dbg}")
-                return False
+                else:
+                    print("Profile saved, checking status...")
+                    return True
             else:
                 print("Failed to get OTP within 2 minutes.")
                 return False
